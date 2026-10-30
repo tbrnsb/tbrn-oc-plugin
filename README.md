@@ -68,6 +68,3 @@ The `agent-finished` plugin (installed separately at `~/.config/opencode/plugins
 
 MIT
 
-## Author
-
-sulav
