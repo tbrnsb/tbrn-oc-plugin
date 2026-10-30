@@ -22,7 +22,7 @@ OpenCode session statistics in a native Omarchy bar panel. Shows tokens, session
 ### Via `omarchy plugin add` (recommended)
 
 ```bash
-omarchy plugin add https://github.com/sulav/tbrn-oc-plugin.git
+omarchy plugin add https://github.com/tbrnsb/tbrn-oc-plugin.git
 ```
 
 Then enable it:
@@ -34,7 +34,7 @@ omarchy plugin enable tbrn.oc-plugin
 ### Manual install
 
 ```bash
-git clone https://github.com/sulav/tbrn-oc-plugin.git ~/.config/omarchy/plugins/tbrn.oc-plugin
+git clone https://github.com/tbrnsb/tbrn-oc-plugin.git ~/.config/omarchy/plugins/tbrn.oc-plugin
 omarchy-shell shell rescanPlugins
 omarchy plugin enable tbrn.oc-plugin
 ```
