@@ -16,13 +16,31 @@ Contract v2 changes (2026-10-29 user batch):
 
 Stability contract:
   - Never writes to the DB; opens file:...?mode=ro with uri=True.
-  - A locked / missing / malformed DB yields a valid ZERO-STATE record, never
-    a crash or a partial object — the panel keeps its last-good record.
+  - A locked / missing / malformed / corrupt DB yields a valid ZERO-STATE
+    record, never a crash or a partial object — the panel keeps its
+    last-good record.
   - Diagnostics go to stderr; stdout carries ONLY the JSON.
 
-The `part` table (~177k rows) is the expensive scan for tool counts, so tool
-counts are cached in ~/.cache/tbrn.oc-plugin/tools.json keyed by
-max(time_updated) over `part`; recomputed only when that advances.
+Schema support (2026-11-04 — V2 table migration):
+  OpenCode historically wrote `session` + `part`; V2.2.0+ additionally writes
+  `session_v2` + `session_message` (same file, both may coexist). The legacy
+  `session` table stopped receiving rows when V2 went live, which froze every
+  breakdown at the switch date while the `opencode stats` overlay kept
+  advancing — the two halves of one panel contradicted each other. This
+  collector therefore:
+  - prefers `session_v2` when it exists AND is non-empty (verified to be a
+    true superset: it contains every legacy id plus the newer rows), falling
+    back to legacy `session` on older installs;
+  - reads tool calls from `session_message` (assistant messages, JSON
+    `content[]` items with type=="tool", name field) when V2 is active,
+    falling back to the legacy `part` scan (`data LIKE '%tool%'`, `tool`
+    field) otherwise;
+  - sums five token columns in V2 (legacy had no tokens_reasoning).
+
+The tool scan is the expensive operation, so its result is cached in
+~/.cache/tbrn.oc-plugin/tools.json keyed by max(rowid) of the source table
+(O(1) probe; MAX(time_updated) would walk every payload page) plus a source
+tag, recomputed only when that advances.
 """
 
 import json
@@ -39,13 +57,44 @@ TOOLS_CACHE = os.path.join(CACHE_DIR, "tools.json")
 OPENCODE_STATS_CACHE = os.path.join(CACHE_DIR, "opencode_stats.json")
 OPENCODE_STATS_TTL = 300  # 5 minutes
 
+# Column pairs by schema family. Row values are read positionally through the
+# idx map built from this list; tokens sum over the five V2 columns, four in
+# legacy (tokens_reasoning absent there).
+SESSION_COLUMNS_V2 = (
+    "model", "agent", "parent_id", "cost", "tokens_input", "tokens_output",
+    "tokens_reasoning", "tokens_cache_read", "tokens_cache_write",
+    "summary_additions", "summary_deletions", "time_created", "time_updated",
+    "project_id",
+)
+SESSION_COLUMNS_LEGACY = (
+    "model", "agent", "parent_id", "cost", "tokens_input", "tokens_output",
+    "tokens_cache_read", "tokens_cache_write",
+    "summary_additions", "summary_deletions", "time_created", "project_id",
+)
+
 
 def zero_state(now_ms=None):
     """A fully-formed empty record. Every key the panel reads is present."""
     return {
         "generatedAt": _iso(now_ms),
         "allTime": {"sessions": 0, "tokens": 0, "additions": 0, "deletions": 0, "cost": 0.0},
-        "stats": {"bestStreak": 0, "currentStreak": 0, "activeDays": 0, "avgTokens": 0},
+        "stats": {
+            "bestStreak": 0,
+            "currentStreak": 0,
+            "activeDays": 0,
+            "avgTokens": 0,
+            "sessions": 0,
+            "subagents": 0,
+            "prompts": 0,
+            "steps": 0,
+            "cost": 0.0,
+            "oc_sessions": None,
+            "oc_subagents": None,
+            "oc_tokens": None,
+            "oc_cost": None,
+            "oc_prompts": None,
+            "oc_steps": None,
+        },
         "daily": [],
         "models": [],
         "agents": [],
@@ -81,12 +130,6 @@ def parse_model(raw):
         return (provider, mid, mid)
     except (ValueError, TypeError):
         return ("?", "forked", "Forked")
-
-
-def _tokens(row):
-    """Sum the four token columns, coercing NULLs to 0."""
-    i, o, cr, cw = row
-    return (i or 0) + (o or 0) + (cr or 0) + (cw or 0)
 
 
 def _local_date(ms):
@@ -165,40 +208,83 @@ def _get_opencode_stats():
     return None
 
 
-def _compute_tools(conn, where_clause="", params=None, top=12):
-    """Aggregate tool-call counts from the `part` table.
-
-    Prefilter on the JSON text with LIKE (json_extract over all rows is slower),
-    then parse. Caching by max(time_updated) keeps this ~6s work off the hot path.
-    """
-    if params is None:
-        params = []
+def _table_exists(conn, name):
     try:
-        cur = conn.execute(f"SELECT max(time_updated) FROM part {where_clause}", params)
-        revision = cur.fetchone()[0] or 0
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        ).fetchone()
+        return row is not None
+    except sqlite3.Error:
+        return False
+
+
+SCHEMAS = (
+    # (source tag, table name, column list)
+    ("v2", "session_v2", SESSION_COLUMNS_V2),
+    ("legacy", "session", SESSION_COLUMNS_LEGACY),
+)
+
+
+def _detect_schema(conn):
+    """Return (tag, table, columns) per DB shape.
+
+    The `session_v2` family wins only when the table exists AND actually has
+    rows: on an old install it may be absent entirely, and a present-but-empty
+    one would otherwise zero out every breakdown while the legacy side still
+    holds history.
+    """
+    for tag, table, cols in SCHEMAS:
+        if not _table_exists(conn, table):
+            continue
+        try:
+            n = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+        except sqlite3.Error:
+            n = 0
+        if n > 0:
+            return (tag, table, cols)
+    return (SCHEMAS[-1][0], SCHEMAS[-1][1], SCHEMAS[-1][2])
+
+
+def _compute_tools(conn, tag):
+    """Aggregate tool-call counts from the active tool-call source.
+
+    V2 reads assistant messages from session_message (content[] items with
+    type=="tool"; the tool name lives in the `name` field). Legacy reads the
+    `part` table ({"tool": name} in data). The result is cached by max(rowid)
+    of the source table plus the source tag — max(rowid) is an O(1) b-tree
+    probe, unlike max(time_updated) which walks every payload page (measured
+    73s on this DB) — and recomputed only when a new row lands.
+
+    Project filtering is not wired into the tool scan today: Main.qml always
+    passes "all". A filtered where clause would also poison the revision-keyed
+    cache with per-project results, so the scan stays unfiltered and honest;
+    revisit only if a project-aware tool listing is ever wired up.
+    """
+    if tag == "v2":
+        rev_sql = "SELECT max(rowid) FROM session_message"
+        like = "WHERE type='assistant' AND data LIKE '%\"tool\"%'"
+        data_sql = f"SELECT data FROM session_message {like}"
+        name_key = "name"
+    else:
+        rev_sql = "SELECT max(rowid) FROM part"
+        like = "WHERE data LIKE '%\"tool\"%'"
+        data_sql = f"SELECT data FROM part {like}"
+        name_key = "tool"
+
+    try:
+        revision = conn.execute(rev_sql).fetchone()[0] or 0
     except sqlite3.Error:
         revision = None
 
     cached = _load_tools_cache()
-    if cached is not None and revision is not None and cached.get("revision") == revision:
+    if cached is not None and revision is not None and _cache_matches(cached, tag, revision):
         return cached.get("tools", [])
 
     counts = {}
     try:
-        # Note: part table doesn't have project_id directly, so we join with session
-        # For simplicity, we'll scan all parts if no project filter, or filter by joining
-        if where_clause:
-            # Join with session to filter by project
-            rows = conn.execute(
-                f"SELECT p.data FROM part p JOIN session s ON p.session_id = s.id {where_clause} AND p.data LIKE '%\"tool\"%'",
-                params
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT data FROM part WHERE data LIKE '%\"tool\"%'"
-            ).fetchall()
+        rows = conn.execute(data_sql).fetchall()
     except sqlite3.Error as e:
-        print(f"tbrn.oc-plugin: part scan failed: {e}", file=sys.stderr)
+        print(f"tbrn.oc-plugin: tool scan failed ({tag}): {e}", file=sys.stderr)
         if cached is not None:
             return cached.get("tools", [])
         return []
@@ -208,20 +294,34 @@ def _compute_tools(conn, where_clause="", params=None, top=12):
             obj = json.loads(data)
         except (ValueError, TypeError):
             continue
-        if not isinstance(obj, dict) or obj.get("type") != "tool":
+        if not isinstance(obj, dict):
             continue
-        name = str(obj.get("tool") or "?")
-        counts[name] = counts.get(name, 0) + 1
+        items = obj.get("content") if tag == "v2" else [obj]
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict) or item.get("type") != "tool":
+                continue
+            name = str(item.get(name_key) or "?")
+            counts[name] = counts.get(name, 0) + 1
 
     tools = sorted(
         ({"name": k, "calls": v} for k, v in counts.items()),
         key=lambda x: x["calls"],
         reverse=True,
-    )[:top]
+    )[:12]
 
     if revision is not None:
-        _save_tools_cache(revision, tools)
+        _save_tools_cache({"src": tag, "revision": revision}, tools)
     return tools
+
+
+def _cache_matches(cached, tag, revision):
+    """Cache hit requires the same source schema AND revision."""
+    got = cached.get("revision")
+    if isinstance(got, dict):
+        return got.get("src") == tag and got.get("revision") == revision
+    return False
 
 
 def _streaks(dates, reference_date=None):
@@ -262,31 +362,6 @@ def _streaks(dates, reference_date=None):
     return (best, cur)
 
 
-def get_projects(db_path=None):
-    """Return list of projects with session counts for dropdown."""
-    db_path = db_path or DB_PATH
-    if not os.path.exists(db_path):
-        return [{"id": "all", "name": "All Projects", "sessions": 0}]
-    try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    except sqlite3.Error:
-        return [{"id": "all", "name": "All Projects", "sessions": 0}]
-    try:
-        rows = conn.execute("""
-            SELECT project_id, COUNT(*) as cnt
-            FROM session
-            GROUP BY project_id
-            ORDER BY cnt DESC
-        """).fetchall()
-        projects = [{"id": "all", "name": "All Projects", "sessions": sum(r[1] for r in rows)}]
-        for pid, cnt in rows:
-            name = "Global" if pid == "global" else (pid[:8] + "…" if len(pid) > 8 else pid)
-            projects.append({"id": pid, "name": name, "sessions": cnt})
-        return projects
-    finally:
-        conn.close()
-
-
 def build_record(db_path=None, now_ms=None, project_id=None):
     """Read the DB and return the full contract record. Never raises on DB problems."""
     db_path = db_path or DB_PATH
@@ -305,7 +380,11 @@ def build_record(db_path=None, now_ms=None, project_id=None):
 
     try:
         return _aggregate(conn, now_ms, project_id)
-    except sqlite3.OperationalError as e:
+    except sqlite3.Error as e:
+        # sqlite3.Error covers OperationalError AND DatabaseError (corrupt
+        # file), plus LockError etc. The previous except caught only
+        # OperationalError, so a corrupt DB crashed with a traceback and no
+        # JSON on stdout.
         print(f"tbrn.oc-plugin: read failed (will retry next tick): {e}", file=sys.stderr)
         return zero_state(now_ms)
     finally:
@@ -317,24 +396,37 @@ def build_record(db_path=None, now_ms=None, project_id=None):
 
 def _aggregate(conn, now_ms, project_id=None):
     # Build WHERE clause for project filter
-    where_clause = ""
-    params = []
-    if project_id and project_id != "all":
-        where_clause = "WHERE project_id = ?"
-        params = [project_id]
+    filtered = bool(project_id and project_id != "all")
+    params = [project_id] if filtered else []
 
-    rows = conn.execute(
-        f"SELECT model, agent, parent_id, cost, tokens_input, tokens_output, "
-        f"tokens_cache_read, tokens_cache_write, summary_additions, "
-        f"summary_deletions, time_created, project_id FROM session {where_clause}",
-        params
-    ).fetchall()
+    _, table, cols = _detect_schema(conn)
+    select = ", ".join(cols)
+    where = f"WHERE project_id = ?" if filtered else ""
+    rows = conn.execute(f"SELECT {select} FROM {table} {where}", params).fetchall()
+
+    # Positional lookup built from the actual column list, so a schema with
+    # reordered/extra columns stays readable instead of hard-indexing.
+    idx = {name: i for i, name in enumerate(cols)}
+    tok_idx = []
+    for name in ("tokens_input", "tokens_output", "tokens_reasoning",
+                 "tokens_cache_read", "tokens_cache_write"):
+        if name in idx:
+            tok_idx.append(idx[name])
+    i_model, i_agent, i_parent = idx["model"], idx["agent"], idx["parent_id"]
+    i_cost = idx["cost"]
+    i_add, i_del = idx["summary_additions"], idx["summary_deletions"]
+    i_tc = idx["time_created"]
+    i_proj = idx["project_id"]
 
     # agent name lookup for dispatch graph (parent_id -> parent's agent)
     agent_of = {}
-    for sid, agent in conn.execute(f"SELECT id, agent FROM session {where_clause}", params):
-        if sid and agent:
-            agent_of[sid] = str(agent)
+    try:
+        cur = conn.execute(f"SELECT id, agent FROM {table} {where}", params)
+        for sid, agent in cur:
+            if sid and agent:
+                agent_of[sid] = str(agent)
+    except sqlite3.Error as e:
+        print(f"tbrn.oc-plugin: agent lookup failed: {e}", file=sys.stderr)
 
     # Fetch OpenCode stats for accurate high-level metrics (matches `opencode stats`)
     oc_stats = _get_opencode_stats()
@@ -348,12 +440,21 @@ def _aggregate(conn, now_ms, project_id=None):
     by_hour = [0] * 24
     dispatch = {}
 
-    for (
-        model, agent, parent_id, cost, ti, to, tcr, tcw, add, dele, tc, proj
-    ) in rows:
-        if tc is None:
+    for row in rows:
+        model = row[i_model]
+        agent = row[i_agent]
+        parent_id = row[i_parent]
+        cost = row[i_cost]
+        tc = row[i_tc]
+        add = row[i_add]
+        dele = row[i_del]
+
+        if tc is None or tc <= 0:
+            # NULL / non-positive timestamps are unrecoverable; bucket like the
+            # legacy None rule (now) so the session still counts, without
+            # polluting 1970 with garbage rows.
             tc = now_ms
-        tok = _tokens((ti, to, tcr, tcw))
+        tok = sum(row[i] or 0 for i in tok_idx)
         c = float(cost or 0.0)
         a = int(add or 0)
         d = int(dele or 0)
@@ -411,13 +512,19 @@ def _aggregate(conn, now_ms, project_id=None):
         reverse=True,
     )[:10]
 
-    # Tools: filter by project if specified
-    tools = _compute_tools(conn, where_clause, params)
+    # Tools: filtered collection is the only supported mode today (project_id
+    # is always "all" from Main.qml); _compute_tools scans the active source.
+    tools = _compute_tools(conn, _detect_schema(conn)[0])
 
     # Projects list for dropdown
     try:
-        proj_rows = conn.execute(f"SELECT project_id, COUNT(*) as cnt FROM session {where_clause} GROUP BY project_id ORDER BY cnt DESC", params).fetchall()
-    except sqlite3.Error:
+        proj_rows = conn.execute(
+            f"SELECT project_id, COUNT(*) as cnt FROM {table} {where}"
+            " GROUP BY project_id ORDER BY cnt DESC",
+            params,
+        ).fetchall()
+    except sqlite3.Error as e:
+        print(f"tbrn.oc-plugin: project rollup failed: {e}", file=sys.stderr)
         proj_rows = []
     total_sessions = sum(r[1] for r in proj_rows)
     projects = [{"id": "all", "name": "All Projects", "sessions": total_sessions}]
@@ -427,26 +534,32 @@ def _aggregate(conn, now_ms, project_id=None):
 
     all_time["cost"] = round(all_time["cost"], 4)
 
+    # The opencode stats overlay exists to make ACTIVITY/ALL-TIME match the
+    # real `opencode stats`. Overlaying it onto an EMPTY local DB would print
+    # real numbers beside zero-token daily history (half-real, half-zero), so
+    # when the queried table is empty we report genuine zeros instead.
+    use_overlay = oc_stats is not None and all_time["sessions"] > 0
+
     return {
         "generatedAt": _iso(now_ms),
         "allTime": all_time,
         "stats": {
-            "bestStreak": oc_stats.get("streak", best_streak) if oc_stats else best_streak,
-            "currentStreak": oc_stats.get("streak", cur_streak) if oc_stats else cur_streak,
-            "activeDays": oc_stats.get("activeDays", active_days) if oc_stats else active_days,
-            "avgTokens": int(round(oc_stats.get("tokens", {}).get("input", 0) + oc_stats.get("tokens", {}).get("output", 0) + oc_stats.get("tokens", {}).get("reasoning", 0) + oc_stats.get("tokens", {}).get("cache", {}).get("read", 0) + oc_stats.get("tokens", {}).get("cache", {}).get("write", 0)) / max(1, oc_stats.get("activeDays", 1))) if oc_stats else avg_tokens,
-            "sessions": oc_stats.get("sessions", all_time["sessions"]) if oc_stats else all_time["sessions"],
-            "subagents": oc_stats.get("subagents", 0) if oc_stats else 0,
-            "prompts": oc_stats.get("prompts", 0) if oc_stats else 0,
-            "steps": oc_stats.get("steps", 0) if oc_stats else 0,
-            "cost": oc_stats.get("cost", all_time["cost"]) if oc_stats else all_time["cost"],
+            "bestStreak": oc_stats.get("streak", best_streak) if use_overlay else best_streak,
+            "currentStreak": oc_stats.get("streak", cur_streak) if use_overlay else cur_streak,
+            "activeDays": oc_stats.get("activeDays", active_days) if use_overlay else active_days,
+            "avgTokens": _oc_avg_tokens(oc_stats) if use_overlay else avg_tokens,
+            "sessions": oc_stats.get("sessions", all_time["sessions"]) if use_overlay else all_time["sessions"],
+            "subagents": oc_stats.get("subagents", 0) if use_overlay else 0,
+            "prompts": oc_stats.get("prompts", 0) if use_overlay else 0,
+            "steps": oc_stats.get("steps", 0) if use_overlay else 0,
+            "cost": oc_stats.get("cost", all_time["cost"]) if use_overlay else all_time["cost"],
             # OpenCode all-time totals for Overview ALL-TIME section
-            "oc_sessions": oc_stats.get("sessions") if oc_stats else None,
-            "oc_subagents": oc_stats.get("subagents") if oc_stats else None,
-            "oc_tokens": oc_stats.get("tokens") if oc_stats else None,
-            "oc_cost": oc_stats.get("cost") if oc_stats else None,
-            "oc_prompts": oc_stats.get("prompts") if oc_stats else None,
-            "oc_steps": oc_stats.get("steps") if oc_stats else None,
+            "oc_sessions": oc_stats.get("sessions") if use_overlay else None,
+            "oc_subagents": oc_stats.get("subagents") if use_overlay else None,
+            "oc_tokens": oc_stats.get("tokens") if use_overlay else None,
+            "oc_cost": oc_stats.get("cost") if use_overlay else None,
+            "oc_prompts": oc_stats.get("prompts") if use_overlay else None,
+            "oc_steps": oc_stats.get("steps") if use_overlay else None,
         },
         "daily": daily,
         "models": models,
@@ -460,9 +573,25 @@ def _aggregate(conn, now_ms, project_id=None):
     }
 
 
+def _oc_avg_tokens(oc_stats):
+    """avg tokens per active day from the opencode stats payload, null-safe."""
+    tokens = oc_stats.get("tokens") or {}
+    read = (tokens.get("cache") or {}).get("read", 0) or 0
+    write = (tokens.get("cache") or {}).get("write", 0) or 0
+    total = (
+        (tokens.get("input") or 0) + (tokens.get("output") or 0)
+        + (tokens.get("reasoning") or 0) + read + write
+    )
+    return int(round(total / max(1, oc_stats.get("activeDays") or 1)))
+
+
 def main():
     project_filter = sys.argv[1] if len(sys.argv) > 1 else "all"
-    record = build_record(project_id=project_filter)
+    try:
+        record = build_record(project_id=project_filter)
+    except Exception as e:  # absolute last resort: main must still emit JSON
+        print(f"tbrn.oc-plugin: unexpected collector failure: {e}", file=sys.stderr)
+        record = zero_state()
     json.dump(record, sys.stdout)
     sys.stdout.write("\n")
 

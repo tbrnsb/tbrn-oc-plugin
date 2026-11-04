@@ -162,7 +162,9 @@ Panel {
   function peakWeek() {
     var weeks = weekData()
     var peak = 0
-    for (var i = 0; i < weeks.length; i++) peak = Math.max(peak, weeks[i])
+    // weeks[i] is an object {tokens,label,formatted}; Math.max coerces objects
+    // to NaN, which used to zero every bar width in the 1M view.
+    for (var i = 0; i < weeks.length; i++) peak = Math.max(peak, Number(weeks[i].tokens || 0))
     return Math.max(1, peak)
   }
 
@@ -358,7 +360,9 @@ Panel {
                 ] : []
                 Item {
                   required property var modelData
-                  width: parent.width / 4
+                  // 7 tiles share the row equally: a fixed width/4 with 7 items
+                  // totalled 175% and clipped the last three tiles.
+                  width: parent.width / 7
                   implicitHeight: tileCol.implicitHeight
                   Column {
                     id: tileCol
@@ -539,7 +543,7 @@ Panel {
               width: parent.width
               textFormat: Text.PlainText
               text: root.rec && root.rec.stats.oc_sessions ? (
-                root.formatTokens(root.rec.stats.oc_tokens ? (root.rec.stats.oc_tokens.input + root.rec.stats.oc_tokens.output + root.rec.stats.oc_tokens.reasoning + root.rec.stats.oc_tokens.cache.read + root.rec.stats.oc_tokens.cache.write) : 0) + " tokens · " + root.rec.stats.oc_sessions + " sessions\n"
+                root.formatTokens(root.rec.stats.oc_tokens ? (root.rec.stats.oc_tokens.input + root.rec.stats.oc_tokens.output + root.rec.stats.oc_tokens.reasoning + (root.rec.stats.oc_tokens.cache?.read || 0) + (root.rec.stats.oc_tokens.cache?.write || 0)) : 0) + " tokens · " + root.rec.stats.oc_sessions + " sessions\n"
                 + "subagents: " + root.rec.stats.oc_subagents + "\n"
                 + "prompts: " + root.rec.stats.oc_prompts + " · steps: " + root.rec.stats.oc_steps + "\n"
                 + root.formatMoney(root.rec.stats.oc_cost)
