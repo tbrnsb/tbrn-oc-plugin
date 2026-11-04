@@ -210,6 +210,63 @@ class TestV2Path(CollectorTestCase):
                          [("coder", 1)])
 
 
+class TestStatsOverlay(CollectorTestCase):
+    """The opencode-stats overlay contract: non-empty local data gets the
+    official numbers, an empty local table gets genuine zeros."""
+
+    def setUp(self):
+        super().setUp()
+        self.oc = {
+            "streak": 22, "activeDays": 30, "sessions": 618, "subagents": 259,
+            "prompts": 4321, "steps": 8642, "cost": 14.94,
+            "tokens": {"input": 10, "output": 20, "reasoning": 5,
+                       "cache": {"read": 30, "write": 0}},
+        }
+
+    def _with_stats(self, sessions, stats=None, patch=True):
+        db = self.v2_db(sessions=sessions)
+        if not patch:
+            return collect.build_record(db_path=db)
+        return_value = self.oc if stats is None else stats
+        with mock.patch.object(collect, "_get_opencode_stats",
+                               return_value=return_value):
+            return collect.build_record(db_path=db)
+
+    def test_overlay_applies_when_local_table_has_sessions(self):
+        s = self._with_stats([self.v2_row(id="x")])
+        self.assertEqual(s["stats"]["sessions"], 618)
+        self.assertEqual(s["stats"]["subagents"], 259)
+        self.assertEqual(s["stats"]["bestStreak"], 22)
+        self.assertEqual(s["stats"]["activeDays"], 30)
+        # avgTokens: (10+20+5+30+0) / 30 active days = 65/30 -> 2
+        self.assertEqual(s["stats"]["avgTokens"], 2)
+        self.assertEqual(s["stats"]["oc_sessions"], 618)
+        self.assertEqual(s["stats"]["oc_cost"], 14.94)
+
+    def test_overlay_coerces_missing_tokens_keys(self):
+        self.oc["tokens"] = {}  # cache totally absent
+        s = self._with_stats([self.v2_row(id="x")])
+        self.assertEqual(s["stats"]["avgTokens"], 0)  # 0 / 30 days
+
+    def test_uses_local_values_when_stats_unavailable(self):
+        # patch=False keeps the base setUp stub (stats source unavailable)
+        s = self._with_stats([self.v2_row(id="x")], patch=False)
+        self.assertEqual(s["stats"]["sessions"], 1)
+        self.assertEqual(s["stats"]["activeDays"], 1)
+        self.assertIsNone(s["stats"]["oc_sessions"])
+
+    def test_empty_local_table_reports_genuine_zeros_even_with_stats(self):
+        # Empty v2 table even WITH stats present -> use_overlay stays False
+        db = self.v2_db()
+        with mock.patch.object(collect, "_get_opencode_stats",
+                               return_value=self.oc):
+            r = collect.build_record(db_path=db)
+        self.assertEqual(r["allTime"]["sessions"], 0)
+        self.assertEqual(r["stats"]["activeDays"], 0)
+        self.assertEqual(r["stats"]["sessions"], 0)
+        self.assertIsNone(r["stats"]["oc_sessions"])
+
+
 class TestLegacyPath(CollectorTestCase):
     def test_legacy_fixture(self):
         data = '{"type":"tool","tool":"edit","callID":"c1","state":{"input":{"filePath":"/a/b"}}}'
