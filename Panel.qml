@@ -345,8 +345,9 @@ Panel {
 
             // ACTIVITY (replaces TODAY) - matches OpenCode /statistics
             PanelSectionHeader { width: parent.width; text: "ACTIVITY"; foreground: root.foreground; fontFamily: root.fontFamily }
-            Row {
+            Grid {
               width: parent.width
+              columns: 4
               spacing: 0
               Repeater {
                 model: root.rec && root.rec.stats ? [
@@ -360,12 +361,14 @@ Panel {
                 ] : []
                 Item {
                   required property var modelData
-                  // 7 tiles share the row equally: a fixed width/4 with 7 items
-                  // totalled 175% and clipped the last three tiles.
-                  width: parent.width / 7
+                  // 4-column grid: 7 tiles share two rows (4 + 3) instead of
+                  // cramming one-row cells, whose centered labels overran
+                  // their neighbors at 1/7 width.
+                  width: parent.width / 4
                   implicitHeight: tileCol.implicitHeight
                   Column {
                     id: tileCol
+                    width: parent.width
                     anchors.centerIn: parent
                     spacing: Style.space(2)
                     Text {
@@ -374,7 +377,9 @@ Panel {
                       color: root.dim
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
+                      width: parent.width
                       horizontalAlignment: Text.AlignHCenter
+                      elide: Text.ElideRight
                     }
                     Text {
                       textFormat: Text.PlainText
@@ -383,7 +388,9 @@ Panel {
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
                       font.bold: true
+                      width: parent.width
                       horizontalAlignment: Text.AlignHCenter
+                      elide: Text.ElideRight
                     }
                   }
                 }
