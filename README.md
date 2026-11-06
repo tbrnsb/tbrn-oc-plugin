@@ -4,7 +4,22 @@ An Omarchy bar widget for OpenCode session stats. A robot icon sits in the bar a
 
 Every number comes from one read-only collector script that reads your local OpenCode database and walks the same aggregates you see in `opencode stats`.
 
-![Screenshot](assets/screenshot.png) ![Screenshot](assets/screenshot2.png)
+<table>
+  <tr>
+    <td align="center" valign="top">
+      <img src="assets/screenshot.png" alt="Dashboard tab: activity tiles, token history with range toggles, tokens by model" width="270"><br>
+      <sub><b>Dashboard</b></sub>
+    </td>
+    <td align="center" valign="top">
+      <img src="assets/screenshot2.png" alt="Story tab: peak hours histogram, agents, dispatch graph" width="270"><br>
+      <sub><b>Story</b></sub>
+    </td>
+    <td align="center" valign="top">
+      <img src="assets/screenshot3.png" alt="Overview tab: all-time totals, tools, providers" width="270"><br>
+      <sub><b>Overview</b></sub>
+    </td>
+  </tr>
+</table>
 
 ## What the tabs show
 
