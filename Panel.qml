@@ -87,7 +87,9 @@ Panel {
     // which counts forks and synthetic rows that `opencode stats` excludes.
     var s = (r.stats && r.stats.sessions) ? Number(r.stats.sessions) : (r.allTime ? r.allTime.sessions : 0)
     var ago = updatedAgo()
-    return formatTokens(s) + " sessions" + (ago ? " · " + ago : "")
+    var meta = formatTokens(s) + " sessions" + (ago ? " · " + ago : "")
+    if (usage.busy) meta += " · refreshing"
+    return meta
   }
 
   function peakDay() {
@@ -107,20 +109,30 @@ Panel {
     return m
   }
 
-  // Total tokens for a range: 0=7D, 1=1M, 2=1Y, 3=ALL
+  // Total tokens for a range: 0=7D, 1=1M, 2=1Y, 3=ALL.
+  // 1M sums the same four weeks the bars show; 1Y sums the last 365 days from
+  // the daily history; ALL uses OpenCode's all-time total so it agrees with
+  // `opencode stats` (falling back to the local sum when stats are missing).
   function rangeTotal(rangeIdx) {
     var r = usage.record
     if (!r) return 0
-    // Use OpenCode stats for 1Y and ALL to match OpenCode's /statistics
-    if (rangeIdx >= 2 && r.stats && r.stats.oc_tokens) {
-      var t = r.stats.oc_tokens
-      return (t.input || 0) + (t.output || 0) + (t.reasoning || 0) + (t.cache?.read || 0) + (t.cache?.write || 0)
+    if (rangeIdx === 3) {
+      if (r.stats && r.stats.oc_tokens) {
+        var t = r.stats.oc_tokens
+        return (t.input || 0) + (t.output || 0) + (t.reasoning || 0) + (t.cache?.read || 0) + (t.cache?.write || 0)
+      }
+      return Number(r.allTime.tokens || 0)
     }
-    if (rangeIdx === 3) return Number(r.allTime.tokens || 0)
+    if (rangeIdx === 1) {
+      var weeks = weekData()
+      var wsum = 0
+      for (var w = 0; w < weeks.length; w++) wsum += Number(weeks[w].tokens || 0)
+      return wsum
+    }
     var m = tokenMap()
     var today = new Date()
     var sum = 0
-    var days = rangeIdx === 0 ? 7 : (rangeIdx === 1 ? 30 : 365)
+    var days = rangeIdx === 0 ? 7 : 365
     for (var d = 0; d < days; d++) {
       var date = new Date(today.getTime() - d * 86400000)
       var key = date.getFullYear() + "-" + String(date.getMonth() + 1).padStart(2, "0") + "-" + String(date.getDate()).padStart(2, "0")
@@ -130,21 +142,9 @@ Panel {
   }
 
   // Week labels for 1M view
-  function weekLabels() {
-    var today = new Date()
-    var labels = []
-    for (var w = 3; w >= 0; w--) {
-      var weekStart = new Date(today.getTime() - w * 7 * 86400000)
-      var weekEnd = new Date(weekStart.getTime() + 6 * 86400000)
-      var label = (w === 3 ? "1st" : w === 2 ? "2nd" : w === 1 ? "3rd" : "4th") + " week"
-      labels.push(label)
-    }
-    return labels
-  }
-
   function weekData() {
     var r = usage.record
-    if (!r || !r.daily) return [{tokens:0,label:"1st week",formatted:"0"},{tokens:0,label:"2nd week",formatted:"0"},{tokens:0,label:"3rd week",formatted:"0"},{tokens:0,label:"4th week",formatted:"0"}]
+    if (!r || !r.daily) return [{tokens:0,label:"3w ago",formatted:"0"},{tokens:0,label:"2w ago",formatted:"0"},{tokens:0,label:"1w ago",formatted:"0"},{tokens:0,label:"This week",formatted:"0"}]
     var m = tokenMap()
     var today = new Date()
     var weeks = []
@@ -155,7 +155,7 @@ Panel {
         var key = date.getFullYear() + "-" + String(date.getMonth() + 1).padStart(2, "0") + "-" + String(date.getDate()).padStart(2, "0")
         sum += m[key] || 0
       }
-      var label = (w === 3 ? "1st" : w === 2 ? "2nd" : w === 1 ? "3rd" : "4th") + " week"
+      var label = (w === 3 ? "3w ago" : w === 2 ? "2w ago" : w === 1 ? "1w ago" : "This week")
       var formatted = sum >= 1e9 ? (sum / 1e9).toFixed(1) + "B" : (sum >= 1e6 ? (sum / 1e6).toFixed(1) + "M" : (sum >= 1e3 ? (sum / 1e3).toFixed(1) + "K" : String(Math.round(sum))))
       weeks.push({tokens: sum, label: label, formatted: formatted})
     }
@@ -299,14 +299,43 @@ Panel {
             }
           }
 
+          // First load, failed load, and empty database are three different
+          // situations; say which one you are looking at.
           Text {
             visible: !root.rec
             width: parent.width
             topPadding: Style.space(24)
-            text: "No OpenCode sessions yet.\nThey show up here once you've run some. (v2)"
-            color: root.dim
+            text: usage.lastError
+              ? "Could not read your OpenCode database.\n" + usage.lastError + "\nPress r to retry."
+              : "Reading your OpenCode database…"
+            color: usage.lastError ? root.urgent : root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.WordWrap
+          }
+
+          // A failed refresh with data on screen: keep the old numbers, but
+          // stop pretending they are current.
+          Text {
+            visible: !!root.rec && usage.lastError !== ""
+            width: parent.width
+            text: "Refresh failed: " + usage.lastError + ". Showing the last good data."
+            color: root.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.WordWrap
+          }
+
+          // Data loaded, but the database has no sessions yet.
+          Text {
+            visible: !!root.rec && root.rec.allTime !== undefined && Number(root.rec.allTime.sessions || 0) === 0 && root.tab === 0
+            width: parent.width
+            text: "No sessions recorded yet. Use OpenCode and this fills in on the next refresh."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
             horizontalAlignment: Text.AlignHCenter
             wrapMode: Text.WordWrap
           }
@@ -462,7 +491,7 @@ Panel {
                 width: parent.width
                 spacing: Style.spacing.xs
                 Repeater {
-                  model: root.rec ? root.weekData() : [{tokens:0,label:"1st week",formatted:"0"},{tokens:0,label:"2nd week",formatted:"0"},{tokens:0,label:"3rd week",formatted:"0"},{tokens:0,label:"4th week",formatted:"0"}]
+                  model: root.rec ? root.weekData() : [{tokens:0,label:"3w ago",formatted:"0"},{tokens:0,label:"2w ago",formatted:"0"},{tokens:0,label:"1w ago",formatted:"0"},{tokens:0,label:"This week",formatted:"0"}]
                   WeekRow {
                     required property var modelData
                     width: parent.width
@@ -584,6 +613,19 @@ Panel {
               collapsedLabel: "Providers"
               expanded: false
             }
+          }
+
+          // Keyboard hints. The panel already accepts these; say so.
+          Text {
+            width: parent.width
+            topPadding: Style.space(4)
+            textFormat: Text.PlainText
+            text: "← → switch tabs · r refresh · right-click the robot opens a terminal"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.WordWrap
           }
 
         }
@@ -1027,7 +1069,8 @@ Panel {
       return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0")
     }
 
-    implicitHeight: heatmap.rows * heatmap.cellSize + (heatmap.rows - 1) * gap
+    readonly property real legendHeight: Style.font.caption + Style.space(8)
+    implicitHeight: heatmap.rows * heatmap.cellSize + (heatmap.rows - 1) * gap + legendHeight
     implicitWidth: heatmap.weeks * heatmap.cellSize + (heatmap.weeks - 1) * gap
 
     // Render grid - row-major order (Grid fills row by row)
@@ -1077,6 +1120,40 @@ Panel {
           height: heatmap.cellSize
           verticalAlignment: Text.AlignVCenter
         }
+      }
+    }
+
+    // Intensity legend, right-aligned under the grid.
+    Row {
+      anchors.top: heatmapGrid.bottom
+      anchors.topMargin: Style.space(6)
+      anchors.right: heatmapGrid.right
+      spacing: Style.space(3)
+      Text {
+        text: "Less"
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        height: heatmap.cellSize
+        verticalAlignment: Text.AlignVCenter
+      }
+      Repeater {
+        model: [0.07, 0.30, 0.55, 0.78, 1.0]
+        Rectangle {
+          required property var modelData
+          width: heatmap.cellSize
+          height: heatmap.cellSize
+          radius: Style.space(2)
+          color: modelData >= 1.0 ? root.foreground : root.alpha(root.foreground, modelData)
+        }
+      }
+      Text {
+        text: "More"
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        height: heatmap.cellSize
+        verticalAlignment: Text.AlignVCenter
       }
     }
   }

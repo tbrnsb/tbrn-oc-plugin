@@ -1,8 +1,8 @@
 # TBRN Opencode
 
-An Omarchy bar widget for OpenCode session stats. A robot icon sits in the bar and opens a three-tab panel: Dashboard, Story, Overview.
+An Omarchy bar widget for OpenCode session stats. A robot icon sits in the bar and opens a panel with three tabs: Dashboard, Story, Overview.
 
-Every number comes from one read-only collector script that reads your local OpenCode database and walks the same aggregates you see in `opencode stats`.
+A small Python collector reads your local OpenCode database, and the panel draws whatever it finds. Nothing leaves your machine.
 
 <table>
   <tr>
@@ -21,46 +21,57 @@ Every number comes from one read-only collector script that reads your local Ope
   </tr>
 </table>
 
-## What the tabs show
+## The tabs
 
-**Dashboard** has your streaks, active days, session counts and a tokens chart with four ranges: 7D day bars, 1M week bars, 1Y and ALL as GitHub-style heatmaps, plus a collapsible tokens-per-model list.
+**Dashboard** shows streaks, active days, session counts, and token history. Four ranges: 7D draws a bar per day, 1M draws a bar per week, 1Y and ALL draw a GitHub-style heatmap with a Less/More legend. The model list stays collapsed until you open it.
 
-**Story** is where your habits live: a 24-hour peak-hours histogram, your top-level agents, a dispatch graph showing who spawned whom, and the subagents they ran.
+**Story** covers how you actually work. Peak hours as a 24-bar histogram, your top-level agents, a dispatch graph of who spawned whom, and the subagents they ran.
 
-**Overview** lists all-time totals (sessions, tokens, prompts, steps, cost), your most-used tools, and providers, rolled up into collapsibles so the tab stays short.
+**Overview** holds all-time totals (sessions, tokens, prompts, steps, cost), your most-used tools, and providers in collapsed rows.
 
 ## Install
 
 ```bash
 omarchy plugin add https://github.com/tbrnsb/tbrn-oc-plugin.git
 omarchy plugin enable tbrn.oc-plugin
-```
-
-Then restart the shell. Bar slots don't hot-replace:
-
-```bash
 omarchy-restart-shell
 ```
 
-Manual install works the same way: clone the repo into `~/.config/omarchy/plugins/tbrn.oc-plugin` instead of using `omarchy plugin add`.
+The restart matters. Bar slots do not hot-replace after install or update.
+
+Manual install: clone the repo into `~/.config/omarchy/plugins/tbrn.oc-plugin` and run the same enable and restart commands.
+
+## Using the panel
+
+| Action | How |
+| --- | --- |
+| Open or close | Click the robot |
+| Switch tabs | `←` `→`, or click a tab |
+| Scroll | Mouse wheel or `↑` `↓` |
+| Refresh now | `r` |
+| Open a terminal | Right-click the robot |
+
+From a script: `omarchy-shell tbrn.oc-plugin open`, `close`, `toggle`, `refresh`, `next`.
+
+While the collector runs, the header adds "refreshing" so a slow scan never looks like a freeze. If a refresh fails, the panel keeps the last good numbers and says so. A first load with no data reads "Reading your OpenCode database…", and a database with no sessions tells you how to fill it.
 
 ## How it works
 
-1. `collect.py` runs and prints one JSON record. It opens OpenCode's database read-only and prefers the newer `session_v2`/`session_message` tables when they exist, falling back to the older `session`/`part` schema otherwise.
-2. For headline numbers it also calls `opencode stats --json` and caches the result for five minutes, so the panel agrees with what OpenCode itself reports.
-3. Tool counts need a full scan of message parts. The result is cached and only recomputed when the source changes, so warm runs take milliseconds and cold runs a few seconds.
-4. `Main.qml` runs the collector every 15 minutes (configurable, 30 second minimum), coalesces overlapping runs, and keeps showing the last good record if a refresh fails.
-5. `Panel.qml` renders the three tabs from that single record.
+1. `collect.py` prints one JSON record. It opens the OpenCode database read-only and prefers the newer `session_v2` and `session_message` tables, falling back to `session` and `part` on older installs.
+2. It also calls `opencode stats --json` for the headline numbers and caches the reply for five minutes, so the panel agrees with OpenCode's own `/statistics` page.
+3. Tool counts come from a full scan of message parts. The collector caches the result and only recomputes it when the source changes, so warm refreshes take milliseconds.
+4. `Main.qml` runs the collector every 15 minutes, collapses overlapping runs into one, and keeps the last good record when a run fails.
+5. `Panel.qml` draws the tabs from that one record.
 
 ## Optional notifications
 
-A companion OpenCode plugin shows a desktop notification when a subagent finishes:
+A companion OpenCode plugin posts a desktop notification when a subagent finishes:
 
 ```
 coder has finished in 18m 12s, consuming 2.0M
 ```
 
-Both files live in this repo under `opencode/`. Copy them into place:
+Both files ship in `opencode/`. Copy them into place:
 
 ```bash
 cp opencode/agent-finished.js ~/.config/opencode/plugins/
@@ -68,25 +79,23 @@ cp opencode/agent-finished-notify.py ~/.local/bin/
 chmod +x ~/.local/bin/agent-finished-notify.py
 ```
 
-OpenCode picks the JavaScript file up on its next start. It spawns the Python script on `session.idle`, which reads the session from your database, formats the message, and calls `notify-send`. The script needs `notify-send` and a working notification daemon.
+OpenCode loads the JavaScript file on its next start. The script reads the session from the database, formats the summary, and calls `notify-send`. Set `AGENT_NOTIFY_ALL=1` to include top-level sessions, or `AGENT_NOTIFY=0` to turn it off.
 
-It only notifies for subagent sessions. Set `AGENT_NOTIFY_ALL=1` to include top-level sessions, or `AGENT_NOTIFY=0` to silence it without removing it.
-
-If nothing appears, check that do-not-disturb is off (Omarchy: `omarchy-toggle-notification-silencing`) and that `notify-send test hello` shows a toast.
+No toast? Check that do-not-disturb is off (`omarchy-toggle-notification-silencing`) and that `notify-send test hello` shows something.
 
 ## Configuration
 
-One setting: `refreshIntervalSec`, default 900, minimum 30, maximum 3600. Change it through Omarchy's plugin settings. The panel accepts manual refresh too: press `R` while it's open or run `omarchy-shell tbrn.oc-plugin refresh`.
+One setting, `refreshIntervalSec`: default 900, minimum 30, maximum 3600. Change it in Omarchy's plugin settings.
 
 ## Troubleshooting
 
-**Panel opens but shows nothing.** Wait a few seconds for the first collector run, then check `journalctl --user -t omarchy-shell` for `tbrn.oc-plugin:` lines.
+**Panel opens empty.** Wait for the first collector run. Then check `journalctl --user -t omarchy-shell` for lines starting with `tbrn.oc-plugin:`.
 
-**Numbers look stale.** Run `omarchy-shell tbrn.oc-plugin refresh`. If OpenCode is busy, `opencode stats --json` can time out; the collector falls back to aggregating the database itself, so you still get data.
+**Numbers look stale.** Press `r`. If OpenCode is mid-write, `opencode stats --json` can time out; the collector falls back to its own aggregation and still returns data.
 
-**Missing icon after a plugin update.** Restart the shell. Again.
+**Robot icon missing.** Restart the shell. Bar slots only mount at shell start.
 
-**Corrupt or locked database.** The collector opens the database `mode=ro` and never writes to it. If OpenCode corrupts a file that's outside this plugin's reach; the panel shows empty numbers rather than crashing.
+**A corrupt database.** The collector opens the file read-only and never writes to it. A failed read produces empty numbers, not a crash.
 
 ## Tests
 
@@ -94,23 +103,24 @@ One setting: `refreshIntervalSec`, default 900, minimum 30, maximum 3600. Change
 python3 -m unittest discover -s tests
 ```
 
-21 tests, stdlib only. They build temporary SQLite fixtures (V2 schema, legacy schema, empty, corrupt, missing tables, malformed rows) and never touch your real database or the `~/.cache` state.
+21 tests, standard library only. They build temporary SQLite fixtures covering the V2 schema, the legacy schema, empty databases, corrupt files, missing tables, and malformed rows. They never touch your real database.
 
 ## Limitations
 
-- The project filter dropdown was removed from Overview. `collect.py` still accepts a project id as an argument, but nothing in the UI passes one.
-- Heatmaps and bar sizes assume Omarchy's default panel width. Very narrow bars can clip long labels.
-- Screenshots live in `assets/` and reflect the state when they were captured.
+- Omarchy sizes the panel for its default bar. Very narrow bars clip long labels.
+- The project filter dropdown is gone. `collect.py` still accepts a project id, but nothing passes one today.
+- Screenshots in `assets/` capture the state at the time they were taken.
 
 ## Uninstall
 
 ```bash
 omarchy plugin disable tbrn.oc-plugin
 omarchy plugin remove tbrn.oc-plugin
+omarchy-restart-shell
 ```
 
-Manual install? Delete `~/.config/omarchy/plugins/tbrn.oc-plugin` and remove the widget from your bar config, then restart the shell. The caches under `~/.cache/tbrn.oc-plugin/` are safe to delete too.
+For a manual install, delete `~/.config/omarchy/plugins/tbrn.oc-plugin`, remove the widget from your bar config, and restart the shell. The cache under `~/.cache/tbrn.oc-plugin/` is safe to delete.
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
