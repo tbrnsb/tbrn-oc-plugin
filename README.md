@@ -4,7 +4,7 @@ An Omarchy bar widget for OpenCode session stats. A robot icon sits in the bar a
 
 Every number comes from one read-only collector script that reads your local OpenCode database and walks the same aggregates you see in `opencode stats`.
 
-![Screenshot](assets/screenshot.png)
+![Screenshot](assets/screenshot.png) ![Screenshot](assets/screenshot2.png)
 
 ## What the tabs show
 
