@@ -1,21 +1,27 @@
 {
   "schemaVersion": 1,
   "id": "tbrn.oc-plugin",
-  "name": "TBRN OC Plugin",
+  "name": "TBRN Opencode",
   "version": "1.0.0",
   "author": "sulav",
   "license": "MIT",
   "description": "OpenCode session statistics in a native Omarchy bar panel: tokens by day, tokens by model, most-used agents, the subagent dispatch graph, peak hours, tools, and lines changed.",
-  "kinds": ["bar-widget"],
+  "kinds": [
+    "bar-widget"
+  ],
   "activation": "on-demand",
   "entryPoints": {
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "TBRN OC Plugin",
+    "displayName": "TBRN Opencode",
     "description": "One bar robot and one three-tab panel (Dashboard, Story, Overview) over the local OpenCode stats database.",
     "category": "AI",
-    "aliases": ["tbrn", "opencode-stats", "oc-stats"],
+    "aliases": [
+      "tbrn",
+      "opencode-stats",
+      "oc-stats"
+    ],
     "allowMultiple": false,
     "defaults": {
       "refreshIntervalSec": 900

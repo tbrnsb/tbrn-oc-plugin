@@ -1,4 +1,4 @@
-# TBRN OC Plugin
+# TBRN Opencode
 
 An Omarchy bar widget for OpenCode session stats. A robot icon sits in the bar and opens a three-tab panel: Dashboard, Story, Overview.
 
