@@ -82,7 +82,10 @@ Panel {
   function heroMeta() {
     var r = usage.record
     if (!r) return ""
-    var s = r.allTime ? r.allTime.sessions : 0
+    // Use the opencode-stats session count so the header agrees with the
+    // ACTIVITY tiles and Overview. allTime.sessions is the raw DB row count,
+    // which counts forks and synthetic rows that `opencode stats` excludes.
+    var s = (r.stats && r.stats.sessions) ? Number(r.stats.sessions) : (r.allTime ? r.allTime.sessions : 0)
     var ago = updatedAgo()
     return formatTokens(s) + " sessions" + (ago ? " · " + ago : "")
   }
