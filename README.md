@@ -54,13 +54,25 @@ Manual install works the same way: clone the repo into `~/.config/omarchy/plugin
 
 ## Optional notifications
 
-A small companion plugin shows a desktop notification when a subagent finishes:
+A companion OpenCode plugin shows a desktop notification when a subagent finishes:
 
 ```
 coder has finished in 18m 12s, consuming 2.0M
 ```
 
-It isn't installed automatically. If you want it, drop `agent-finished.js` into `~/.config/opencode/plugins/` and make sure `notify-send` works. The widget runs fine without it.
+Both files live in this repo under `opencode/`. Copy them into place:
+
+```bash
+cp opencode/agent-finished.js ~/.config/opencode/plugins/
+cp opencode/agent-finished-notify.py ~/.local/bin/
+chmod +x ~/.local/bin/agent-finished-notify.py
+```
+
+OpenCode picks the JavaScript file up on its next start. It spawns the Python script on `session.idle`, which reads the session from your database, formats the message, and calls `notify-send`. The script needs `notify-send` and a working notification daemon.
+
+It only notifies for subagent sessions. Set `AGENT_NOTIFY_ALL=1` to include top-level sessions, or `AGENT_NOTIFY=0` to silence it without removing it.
+
+If nothing appears, check that do-not-disturb is off (Omarchy: `omarchy-toggle-notification-silencing`) and that `notify-send test hello` shows a toast.
 
 ## Configuration
 
