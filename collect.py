@@ -37,12 +37,14 @@ Schema support (2026-11-04 — V2 table migration):
     field) otherwise;
   - sums five token columns in V2 (legacy had no tokens_reasoning).
 
-The tool scan is the expensive operation, so its result is cached in
+The tool scan is the expensive operation, so its result (tool counts AND the
+added/removed line totals derived from edit/write/patch calls) is cached in
 ~/.cache/tbrn.oc-plugin/tools.json keyed by max(rowid) of the source table
 (O(1) probe; MAX(time_updated) would walk every payload page) plus a source
 tag, recomputed only when that advances.
 """
 
+import difflib
 import json
 import os
 import sqlite3
@@ -54,6 +56,7 @@ from datetime import date, datetime, timedelta, timezone
 DB_PATH = os.path.expanduser("~/.local/share/opencode/opencode.db")
 CACHE_DIR = os.path.expanduser("~/.cache/tbrn.oc-plugin")
 TOOLS_CACHE = os.path.join(CACHE_DIR, "tools.json")
+TOOLS_CACHE_VERSION = 3  # v3: incremental scan + counts dict
 OPENCODE_STATS_CACHE = os.path.join(CACHE_DIR, "opencode_stats.json")
 OPENCODE_STATS_TTL = 300  # 5 minutes
 
@@ -144,11 +147,13 @@ def _load_tools_cache():
         return None
 
 
-def _save_tools_cache(revision, tools):
+def _save_tools_cache(revision, tools, additions=0, deletions=0, counts=None):
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
         with open(TOOLS_CACHE, "w") as f:
-            json.dump({"revision": revision, "tools": tools}, f)
+            json.dump({"v": TOOLS_CACHE_VERSION, "revision": revision,
+                       "tools": tools, "additions": additions,
+                       "deletions": deletions, "counts": counts or {}}, f)
     except OSError as e:
         print(f"tbrn.oc-plugin: could not write tools cache: {e}", file=sys.stderr)
 
@@ -245,51 +250,114 @@ def _detect_schema(conn):
     return (SCHEMAS[-1][0], SCHEMAS[-1][1], SCHEMAS[-1][2])
 
 
+def _line_delta(name, item):
+    """(added, removed) lines for one completed edit/write/patch tool call.
+
+    OpenCode v2 stopped populating session.summary_additions/deletions (all 0
+    on this DB), so the honest source is the tool call itself:
+      - write: every line in `content` is an addition
+      - edit:  diff `oldString` -> `newString` line-wise
+      - patch: count unified-diff +/- lines, ignoring the +++/--- headers
+    Failed calls are ignored. Unknown shapes return (0, 0) rather than guessing.
+    """
+    state = item.get("state")
+    if not isinstance(state, dict) or state.get("status") != "completed":
+        return (0, 0)
+    inp = state.get("input")
+    if not isinstance(inp, dict):
+        return (0, 0)
+
+    if name == "write":
+        content = inp.get("content")
+        if not isinstance(content, str):
+            return (0, 0)
+        return (len(content.splitlines()), 0)
+
+    if name == "edit":
+        old = inp.get("oldString")
+        new = inp.get("newString")
+        if not isinstance(old, str) or not isinstance(new, str):
+            return (0, 0)
+        sm = difflib.SequenceMatcher(None, old.splitlines(), new.splitlines(),
+                                     autojunk=False)
+        added = removed = 0
+        for op, i1, i2, j1, j2 in sm.get_opcodes():
+            if op in ("replace", "delete"):
+                removed += i2 - i1
+            if op in ("replace", "insert"):
+                added += j2 - j1
+        return (added, removed)
+
+    if name == "patch":
+        text = inp.get("patchText") or inp.get("patch") or ""
+        if not isinstance(text, str):
+            return (0, 0)
+        added = removed = 0
+        for line in text.splitlines():
+            if line.startswith("+") and not line.startswith("+++"):
+                added += 1
+            elif line.startswith("-") and not line.startswith("---"):
+                removed += 1
+        return (added, removed)
+
+    return (0, 0)
+
+
 def _compute_tools(conn, tag):
-    """Aggregate tool-call counts from the active tool-call source.
+    """Aggregate tool-call counts and edit line totals from the active source.
 
     V2 reads assistant messages from session_message (content[] items with
-    type=="tool"; the tool name lives in the `name` field). Legacy reads the
-    `part` table ({"tool": name} in data). The result is cached by max(rowid)
-    of the source table plus the source tag — max(rowid) is an O(1) b-tree
-    probe, unlike max(time_updated) which walks every payload page (measured
-    73s on this DB) — and recomputed only when a new row lands.
+    type=="tool"). Legacy reads the `part` table. The scan is INCREMENTAL:
+    the cache holds the aggregate plus the rowid watermark it was built at, so
+    a refresh only parses rows written since the last run. A cold scan of this
+    DB is ~20 s; an incremental one is milliseconds.
 
     Project filtering is not wired into the tool scan today: Main.qml always
-    passes "all". A filtered where clause would also poison the revision-keyed
-    cache with per-project results, so the scan stays unfiltered and honest;
-    revisit only if a project-aware tool listing is ever wired up.
+    passes "all". A filtered where clause would poison the shared cache with
+    per-project results, so the scan stays unfiltered and honest.
     """
     if tag == "v2":
-        rev_sql = "SELECT max(rowid) FROM session_message"
-        like = "WHERE type='assistant' AND data LIKE '%\"tool\"%'"
-        data_sql = f"SELECT data FROM session_message {like}"
+        table = "session_message"
+        extra = "type='assistant' AND data LIKE '%\"tool\"%'"
         name_key = "name"
     else:
-        rev_sql = "SELECT max(rowid) FROM part"
-        like = "WHERE data LIKE '%\"tool\"%'"
-        data_sql = f"SELECT data FROM part {like}"
+        table = "part"
+        extra = "data LIKE '%\"tool\"%'"
         name_key = "tool"
 
     try:
-        revision = conn.execute(rev_sql).fetchone()[0] or 0
+        revision = conn.execute(f"SELECT max(rowid) FROM {table}").fetchone()[0] or 0
     except sqlite3.Error:
         revision = None
 
     cached = _load_tools_cache()
     if cached is not None and revision is not None and _cache_matches(cached, tag, revision):
-        return cached.get("tools", [])
+        return _cached_result(cached)
 
     counts = {}
+    additions = deletions = 0
+    since = 0
+    got = cached.get("revision") if isinstance(cached, dict) else None
+    if (isinstance(cached, dict) and cached.get("v") == TOOLS_CACHE_VERSION
+            and isinstance(got, dict) and got.get("src") == tag
+            and isinstance(got.get("revision"), int)
+            and isinstance(cached.get("counts"), dict)):
+        since = got["revision"]
+        counts = dict(cached["counts"])
+        additions = int(cached.get("additions") or 0)
+        deletions = int(cached.get("deletions") or 0)
+
     try:
-        rows = conn.execute(data_sql).fetchall()
+        rows = conn.execute(
+            f"SELECT rowid, data FROM {table} WHERE rowid > ? AND {extra}",
+            (since,),
+        ).fetchall()
     except sqlite3.Error as e:
         print(f"tbrn.oc-plugin: tool scan failed ({tag}): {e}", file=sys.stderr)
-        if cached is not None:
-            return cached.get("tools", [])
-        return []
+        return _cached_result(cached) if cached is not None else {
+            "tools": [], "additions": 0, "deletions": 0}
 
-    for (data,) in rows:
+    for _rowid, data in rows:
         try:
             obj = json.loads(data)
         except (ValueError, TypeError):
@@ -304,6 +372,10 @@ def _compute_tools(conn, tag):
                 continue
             name = str(item.get(name_key) or "?")
             counts[name] = counts.get(name, 0) + 1
+            if name in ("edit", "write", "patch"):
+                a, d = _line_delta(name, item)
+                additions += a
+                deletions += d
 
     tools = sorted(
         ({"name": k, "calls": v} for k, v in counts.items()),
@@ -312,12 +384,23 @@ def _compute_tools(conn, tag):
     )[:12]
 
     if revision is not None:
-        _save_tools_cache({"src": tag, "revision": revision}, tools)
-    return tools
+        _save_tools_cache({"src": tag, "revision": revision}, tools,
+                          additions, deletions, counts)
+    return {"tools": tools, "additions": additions, "deletions": deletions}
+
+
+def _cached_result(cached):
+    return {
+        "tools": cached.get("tools", []),
+        "additions": int(cached.get("additions") or 0),
+        "deletions": int(cached.get("deletions") or 0),
+    }
 
 
 def _cache_matches(cached, tag, revision):
-    """Cache hit requires the same source schema AND revision."""
+    """Cache hit requires the same cache version, source schema AND revision."""
+    if cached.get("v") != TOOLS_CACHE_VERSION:
+        return False
     got = cached.get("revision")
     if isinstance(got, dict):
         return got.get("src") == tag and got.get("revision") == revision
@@ -399,7 +482,10 @@ def _aggregate(conn, now_ms, project_id=None):
     filtered = bool(project_id and project_id != "all")
     params = [project_id] if filtered else []
 
-    _, table, cols = _detect_schema(conn)
+    tag, table, cols = _detect_schema(conn)
+    # Run the cached tool scan now: it also yields the derived line totals the
+    # v2 schema no longer stores in summary_additions/deletions.
+    tool_data = _compute_tools(conn, tag)
     select = ", ".join(cols)
     where = f"WHERE project_id = ?" if filtered else ""
     rows = conn.execute(f"SELECT {select} FROM {table} {where}", params).fetchall()
@@ -494,6 +580,12 @@ def _aggregate(conn, now_ms, project_id=None):
             key = (parent_agent, str(agent))
             dispatch[key] = dispatch.get(key, 0) + 1
 
+    # V2 no longer fills summary_additions/deletions (verified: 0 across 977
+    # sessions), so the tool scan's derived totals are the only honest source.
+    if tag == "v2" and (tool_data["additions"] or tool_data["deletions"]):
+        all_time["additions"] = tool_data["additions"]
+        all_time["deletions"] = tool_data["deletions"]
+
     daily = sorted(by_day.values(), key=lambda x: x["date"])
 
     # Determine reference date for current streak: most recent session date
@@ -514,7 +606,7 @@ def _aggregate(conn, now_ms, project_id=None):
 
     # Tools: filtered collection is the only supported mode today (project_id
     # is always "all" from Main.qml); _compute_tools scans the active source.
-    tools = _compute_tools(conn, _detect_schema(conn)[0])
+    tools = tool_data["tools"]
 
     # Projects list for dropdown
     try:

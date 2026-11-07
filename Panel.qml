@@ -585,9 +585,10 @@ Panel {
                 root.formatTokens(root.rec.stats.oc_tokens ? (root.rec.stats.oc_tokens.input + root.rec.stats.oc_tokens.output + root.rec.stats.oc_tokens.reasoning + (root.rec.stats.oc_tokens.cache?.read || 0) + (root.rec.stats.oc_tokens.cache?.write || 0)) : 0) + " tokens · " + root.rec.stats.oc_sessions + " sessions\n"
                 + "subagents: " + root.rec.stats.oc_subagents + "\n"
                 + "prompts: " + root.rec.stats.oc_prompts + " · steps: " + root.rec.stats.oc_steps + "\n"
+                + "+" + root.formatTokens(root.rec.allTime.additions) + " / -" + root.formatTokens(root.rec.allTime.deletions) + " lines · "
                 + root.formatMoney(root.rec.stats.oc_cost)
               ) : (root.rec ? (root.formatTokens(root.rec.allTime.tokens) + " tokens · " + root.rec.allTime.sessions + " sessions\n"
-                                + "+" + root.rec.allTime.additions + " / -" + root.rec.allTime.deletions + " lines · "
+                                + "+" + root.formatTokens(root.rec.allTime.additions) + " / -" + root.formatTokens(root.rec.allTime.deletions) + " lines · "
                                 + root.formatMoney(root.rec.allTime.cost)) : "")
               color: root.foreground
               font.family: root.fontFamily
